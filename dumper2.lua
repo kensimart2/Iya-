@@ -176,7 +176,12 @@ local _proxyTags        = hostSetmetatable({}, { __mode = "k" })
 local _allInstances     = hostSetmetatable({}, { __mode = "k" })
 local _readOnlyMap      = hostSetmetatable({}, { __mode = "k" })
 local _cclosureSet      = hostSetmetatable({}, { __mode = "k" })
+local _cclosureNames    = hostSetmetatable({}, { __mode = "k" })
 local _hookedMap        = hostSetmetatable({}, { __mode = "k" })
+local _hookCells        = hostSetmetatable({}, { __mode = "k" })
+local _namecallHookedObjs = hostSetmetatable({}, { __mode = "k" })
+local _invalidatedCache = hostSetmetatable({}, { __mode = "k" })
+local _cacheReplaced    = hostSetmetatable({}, { __mode = "k" })
 local _editableMeshes   = hostSetmetatable({}, { __mode = "k" })
 local _currentNamecallMethod = ""
 
@@ -801,6 +806,32 @@ local _Axes  = {
 local _OverlapParams
 local _RaycastParams
 local _PathWaypoint = { new = function(pos, act, lbl) return hostSetmetatable({ Position = pos or _Vector3.zero, Action = act, Label = lbl or "" }, { __type = "PathWaypoint" }) end }
+local _FloatCurveKey = {
+    new = function(...)
+        local t, v, interp = ...
+        return hostSetmetatable({
+            Time = hostTonumber(t) or 0,
+            Value = hostTonumber(v) or 0,
+            Interpolation = interp or (_Enum and _Enum.KeyInterpolationMode and _Enum.KeyInterpolationMode.Linear),
+            LeftTangent = 0,
+            RightTangent = 0,
+        }, { __type = "FloatCurveKey" })
+    end,
+}
+local _DockWidgetPluginGuiInfo = {
+    new = function(...)
+        local dockState, initEnabled, overrideRestore, floatX, floatY, minW, minH = ...
+        return hostSetmetatable({
+            InitialDockState = dockState or (_Enum and _Enum.InitialDockState and _Enum.InitialDockState.Float),
+            InitialEnabled = initEnabled ~= false,
+            InitialEnabledShouldOverrideRestore = overrideRestore == true,
+            FloatingXSize = hostTonumber(floatX) or 0,
+            FloatingYSize = hostTonumber(floatY) or 0,
+            MinWidth = hostTonumber(minW) or 0,
+            MinHeight = hostTonumber(minH) or 0,
+        }, { __type = "DockWidgetPluginGuiInfo" })
+    end,
+}
 local _Random = {
     new = function()
         local mt = { __type = "Random", __metatable = "The metatable is locked" }
@@ -1425,7 +1456,7 @@ local function _makeInstanceProxy(className, name, parent, extraProps)
                 local copy = {}
                 for i = 1, #children do copy[i] = children[i] end
                 for i = 1, #copy do
-                    _setParentInternal(copy[i], nil, 2)
+                    _destroyInternal(copy[i])
                 end
             end
         elseif key == "GetAttribute" then
@@ -1543,7 +1574,44 @@ local function _makeInstanceProxy(className, name, parent, extraProps)
         return nil
     end
 
-    local mt = {
+    local mt
+    local function _origInstLookup(self, key)
+        local base = _refBaseMap[self] or self
+        if key == "Parent" then return _proxyParent[base] end
+        local p = _proxyProps[base] or props
+        if p[key] ~= nil then return p[key] end
+        if methodCache[key] then return methodCache[key] end
+        local bm = _baseMethod(key)
+        if bm then
+            methodCache[key] = bm
+            return bm
+        end
+        for _, ch in hostIpairs(_proxyChildren[base] or {}) do
+            local cp = _proxyProps[ch]
+            if cp and cp.Name == key then return ch end
+        end
+        local cn = p.ClassName or className
+        if _knownSignalNames[key] or _hasApiMember(cn, "E", key) then
+            return _getCachedSignal(_proxySignals, base, key, key)
+        end
+        if _hasApiMember(cn, "P", key) or _hasApiMember(cn, "C", key) then
+            return nil
+        end
+        local isSvc = _services and _services[cn] == base
+        local isApiMethod = isSvc and _hasApiMember(cn, "F", key)
+        local fn = function(self, ...)
+            if isApiMethod and self ~= nil and (_refBaseMap[self] or self) == base then
+                local svcPrefix = (cn == "Workspace") and "workspace" or ('game:GetService("' .. cn .. '")')
+                _emitApiCall("svcm:" .. cn .. ":" .. key, string.format("%s:%s(%s)", svcPrefix, key, _formatArgs(...)), 3)
+            end
+            return nil
+        end
+        _cclosureSet[fn] = true
+        methodCache[key] = fn
+        return fn
+    end
+
+    mt = {
         __type = "Instance",
         __tostring = function(self)
             local base = _refBaseMap[self] or self
@@ -1552,39 +1620,17 @@ local function _makeInstanceProxy(className, name, parent, extraProps)
         end,
         __metatable = "The metatable is locked",
         __index = function(self, key)
-            local base = _refBaseMap[self] or self
-            if key == "Parent" then return _proxyParent[base] end
-            local p = _proxyProps[base] or props
-            if p[key] ~= nil then return p[key] end
-            if methodCache[key] then return methodCache[key] end
-            local bm = _baseMethod(key)
-            if bm then
-                methodCache[key] = bm
-                return bm
-            end
-            for _, ch in hostIpairs(_proxyChildren[base] or {}) do
-                local cp = _proxyProps[ch]
-                if cp and cp.Name == key then return ch end
-            end
-            local cn = p.ClassName or className
-            if _knownSignalNames[key] or _hasApiMember(cn, "E", key) then
-                return _getCachedSignal(_proxySignals, base, key, key)
-            end
-            if _hasApiMember(cn, "P", key) or _hasApiMember(cn, "C", key) then
-                return nil
-            end
-            local isSvc = _services and _services[cn] == base
-            local isApiMethod = isSvc and _hasApiMember(cn, "F", key)
-            local fn = function(self, ...)
-                if isApiMethod and self ~= nil and (_refBaseMap[self] or self) == base then
-                    local svcPrefix = (cn == "Workspace") and "workspace" or ('game:GetService("' .. cn .. '")')
-                    _emitApiCall("svcm:" .. cn .. ":" .. key, string.format("%s:%s(%s)", svcPrefix, key, _formatArgs(...)), 3)
+            local val = _origInstLookup(self, key)
+            if self ~= _game and _namecallHookedObjs[self] and (hostType(val) == "function" or val == nil) then
+                return function(s, ...)
+                    local prev = _currentNamecallMethod
+                    _currentNamecallMethod = hostTostring(key)
+                    local res = hostPack(mt.__namecall(s, ...))
+                    _currentNamecallMethod = prev
+                    return hostUnpack(res, 1, res.n)
                 end
-                return nil
             end
-            _cclosureSet[fn] = true
-            methodCache[key] = fn
-            return fn
+            return val
         end,
         __newindex = function(self, key, val)
             local base = _refBaseMap[self] or self
@@ -1627,6 +1673,14 @@ local function _makeInstanceProxy(className, name, parent, extraProps)
                     hostError("Unable to assign property Value. number expected, got " .. _sandboxType(val), 2)
                 end
                 val = n
+            elseif cn == "Player" and (key == "CameraMinZoomDistance" or key == "CameraMaxZoomDistance") then
+                local n = hostTonumber(val)
+                if n == nil or n < 0 then
+                    hostError("Value must be greater than or equal to 0", 2)
+                end
+                val = n
+            elseif cn == "Workspace" and key == "DistributedGameTime" then
+                hostError("Unable to assign property DistributedGameTime. Property is read only", 2)
             elseif cn == "BoolValue" and key == "Value" then
                 if hostType(val) ~= "boolean" then
                     hostError("Unable to assign property Value. boolean expected, got " .. _sandboxType(val), 2)
@@ -1711,7 +1765,7 @@ local function _makeInstanceProxy(className, name, parent, extraProps)
         end,
         __namecall = function(self, ...)
             local method = _currentNamecallMethod
-            local fn = self[method]
+            local fn = _origInstLookup(self, method)
             if hostType(fn) == "function" then
                 return fn(self, ...)
             end
@@ -2573,6 +2627,7 @@ _game = _makeInstanceProxy("DataModel", "Game", nil, {
     GameId = 987654321,
     JobId = "00000000-0000-0000-0000-000000000000",
     CreatorId = 1,
+    CreatorType = _Enum.CreatorType.User,
     IsLoaded = function() return true end,
 })
 _proxyPaths[_game] = "game"
@@ -2596,8 +2651,12 @@ local function _registerService(className, extraProps)
                     end
                     return hostUnpack(res, 1, res.n)
                 end
-                _cclosureSet[wrapped] = true
-                wrappedProps[k] = wrapped
+                local cell = { f = wrapped, orig = wrapped }
+                local hkWrap = function(...) return cell.f(...) end
+                _hookCells[hkWrap] = cell
+                _cclosureSet[hkWrap] = true
+                _cclosureNames[hkWrap] = hostTostring(k)
+                wrappedProps[k] = hkWrap
             else
                 wrappedProps[k] = v
             end
@@ -2611,7 +2670,7 @@ end
 
 _workspace = _registerService("Workspace", {
     Gravity = 196.2,
-    DistributedGameTime = 10,
+    DistributedGameTime = 100,
     StreamingEnabled = false,
     FallenPartsDestroyHeight = -500,
     AirDensity = 0.0012,
@@ -2805,8 +2864,29 @@ _workspace.CurrentCamera = _workspace:FindFirstChild("CurrentCamera")
 local _terrain = _createInstance("Terrain", "Terrain", _workspace)
 _workspace.Terrain = _terrain
 
+local _playerMouse = _makeInstanceProxy("Mouse", "Mouse", nil, {
+    X = 960,
+    Y = 540,
+    ViewSizeX = 1920,
+    ViewSizeY = 1080,
+    Hit = _CFrame.new(),
+    Origin = _CFrame.new(),
+    Target = nil,
+    TargetFilter = nil,
+    Icon = "",
+    Button1Down = _makeSignal("Button1Down"),
+    Button1Up = _makeSignal("Button1Up"),
+    Button2Down = _makeSignal("Button2Down"),
+    Button2Up = _makeSignal("Button2Up"),
+    Move = _makeSignal("Move"),
+    WheelForward = _makeSignal("WheelForward"),
+    WheelBackward = _makeSignal("WheelBackward"),
+    KeyDown = _makeSignal("KeyDown"),
+    KeyUp = _makeSignal("KeyUp"),
+})
 local _localPlayer = _makeInstanceProxy("Player", "Player", nil, {
     UserId = 1234567,
+    FollowUserId = 0,
     AccountAge = 1000,
     DisplayName = "Player",
     MembershipType = _Enum.MembershipType.None,
@@ -2816,7 +2896,14 @@ local _localPlayer = _makeInstanceProxy("Player", "Player", nil, {
     CameraMinZoomDistance = 0.5,
     CameraMaxZoomDistance = 128,
     GetFriendAsync = function() return {} end,
+    GetMouse = function() return _playerMouse end,
 })
+local _playerGui = _createInstance("PlayerGui", "PlayerGui", _localPlayer)
+local _backpack = _createInstance("Backpack", "Backpack", _localPlayer)
+local _playerScripts = _createInstance("PlayerScripts", "PlayerScripts", _localPlayer)
+_localPlayer.PlayerGui = _playerGui
+_localPlayer.Backpack = _backpack
+_localPlayer.PlayerScripts = _playerScripts
 local _character = _createInstance("Model", "Player", _workspace)
 local _hrp = _createInstance("Part", "HumanoidRootPart", _character, { Position = _Vector3.new(5000, 5, 5000), CFrame = _CFrame.new(5000, 5, 5000), Anchored = true })
 _createInstance("Part", "Head", _character, { Position = _Vector3.new(5000, 6.5, 5000), Anchored = true })
@@ -3159,6 +3246,51 @@ _registerService("TweenService", {
         end
         return output, currentVelocity
     end,
+    GetValue = function(_, alpha, easingStyle, easingDirection)
+        local t = math.clamp(hostTonumber(alpha) or 0, 0, 1)
+        local st = hostType(easingStyle) == "table" and easingStyle.Name or hostTostring(easingStyle or "Linear")
+        local dr = hostType(easingDirection) == "table" and easingDirection.Name or hostTostring(easingDirection or "Out")
+        if st == "Linear" then
+            return t
+        end
+        local function easeIn(x)
+            if st == "Quad" then return x * x
+            elseif st == "Cubic" then return x * x * x
+            elseif st == "Quart" then return x ^ 4
+            elseif st == "Quint" then return x ^ 5
+            elseif st == "Sine" then return 1 - math.cos((x * math.pi) * 0.5)
+            elseif st == "Exponential" then return x == 0 and 0 or 2 ^ (10 * x - 10)
+            elseif st == "Circular" then return 1 - math.sqrt(math.max(0, 1 - x * x))
+            elseif st == "Back" then
+                local c1 = 1.70158
+                return (c1 + 1) * x * x * x - c1 * x * x
+            elseif st == "Elastic" then
+                if x == 0 or x == 1 then return x end
+                return -(2 ^ (10 * x - 10)) * math.sin((x * 10 - 10.75) * ((2 * math.pi) / 3))
+            elseif st == "Bounce" then
+                local function bounceOut(u)
+                    local n1, d1 = 7.5625, 2.75
+                    if u < 1 / d1 then return n1 * u * u
+                    elseif u < 2 / d1 then u = u - 1.5 / d1; return n1 * u * u + 0.75
+                    elseif u < 2.5 / d1 then u = u - 2.25 / d1; return n1 * u * u + 0.9375
+                    else u = u - 2.625 / d1; return n1 * u * u + 0.984375 end
+                end
+                return 1 - bounceOut(1 - x)
+            end
+            return x
+        end
+        if dr == "In" then
+            return easeIn(t)
+        elseif dr == "Out" then
+            return 1 - easeIn(1 - t)
+        else
+            if t < 0.5 then
+                return easeIn(t * 2) * 0.5
+            else
+                return 1 - easeIn((1 - t) * 2) * 0.5
+            end
+        end
+    end,
 })
 
 _registerService("VoiceChatService", {
@@ -3264,6 +3396,21 @@ _registerService("CollectionService", {
         end
         return out
     end,
+    GetAllTags = function()
+        local out = {}
+        local seen = {}
+        for inst, tags in hostPairs(_proxyTags) do
+            if not _destroyedMap[inst] and hostType(tags) == "table" then
+                for tag in hostPairs(tags) do
+                    if not seen[tag] then
+                        seen[tag] = true
+                        out[#out + 1] = tag
+                    end
+                end
+            end
+        end
+        return out
+    end,
 })
 
 local _marketplaceService = _registerService("MarketplaceService", {
@@ -3308,6 +3455,11 @@ _registerService("DataStoreService", {
 _registerService("Stats", { HeartbeatTimeMs = 16.6, InstanceCount = 50 })
 _registerService("Teams", { GetTeams = function() return {} end })
 _registerService("TextService", { GetTextSize = function() return _Vector2.new(100, 20) end })
+_registerService("ContentProvider", {
+    RequestQueueSize = 0,
+    GetRequestQueueSize = function() return 0 end,
+    PreloadAsync = function() end,
+})
 _registerService("AchievementService", {
     IsAvailable = function() return true end,
     HasAchieved = function() return false end,
@@ -3369,27 +3521,49 @@ end
 _cclosureSet[_gameGetServiceFn] = true
 _cclosureSet[_gameFindServiceFn] = true
 
-local _gameHooks = {
+local function _rawGameIndex(self, key)
+    if key == "GetService" or key == "getService" then
+        return _gameGetServiceFn
+    end
+    if key == "FindService" then
+        return _gameFindServiceFn
+    end
+    if _services[key] then
+        _emitApiCall("svc:" .. key, string.format("game:GetService(%s)", _formatArg(key, 0)), 1)
+        return _services[key]
+    end
+    if hostType(key) == "string" and (_apiClassSuper[key] or key:match("Service$")) and not _hasApiMember("DataModel", "F", key) and not _hasApiMember("DataModel", "P", key) and not _hasApiMember("DataModel", "E", key) then
+        local svc = _registerService(key, {})
+        _emitApiCall("svc:" .. key, string.format("game:GetService(%s)", _formatArg(key, 0)), 1)
+        return svc
+    end
+    return _origGameIndex(self, key)
+end
+local _origGameNamecall = function(self, ...)
+    local method = _currentNamecallMethod
+    local fn = _rawGameIndex(self, method)
+    if hostType(fn) == "function" then
+        return fn(self, ...)
+    end
+    return nil
+end
+local _gameHooks
+_gameHooks = {
     __index = function(self, key)
-        if key == "GetService" or key == "getService" then
-            return _gameGetServiceFn
+        local val = _rawGameIndex(self, key)
+        if _namecallHookedObjs[_game] and (hostType(val) == "function" or val == nil) then
+            return function(s, ...)
+                local prev = _currentNamecallMethod
+                _currentNamecallMethod = hostTostring(key)
+                local res = hostPack(_gameHooks.__namecall(s, ...))
+                _currentNamecallMethod = prev
+                return hostUnpack(res, 1, res.n)
+            end
         end
-        if key == "FindService" then
-            return _gameFindServiceFn
-        end
-        if _services[key] then
-            _emitApiCall("svc:" .. key, string.format("game:GetService(%s)", _formatArg(key, 0)), 1)
-            return _services[key]
-        end
-        if hostType(key) == "string" and (_apiClassSuper[key] or key:match("Service$")) and not _hasApiMember("DataModel", "F", key) and not _hasApiMember("DataModel", "P", key) and not _hasApiMember("DataModel", "E", key) then
-            local svc = _registerService(key, {})
-            _emitApiCall("svc:" .. key, string.format("game:GetService(%s)", _formatArg(key, 0)), 1)
-            return svc
-        end
-        return _origGameIndex(self, key)
+        return val
     end,
     __newindex = _gameRawMt.__newindex,
-    __namecall = _gameRawMt.__namecall,
+    __namecall = _origGameNamecall,
 }
 local _gameIndexDispatch = function(self, key) return _gameHooks.__index(self, key) end
 local _gameNewIndexDispatch = function(self, key, val) return _gameHooks.__newindex(self, key, val) end
@@ -3397,6 +3571,7 @@ local _gameNamecallDispatch = function(self, ...) return _gameHooks.__namecall(s
 _cclosureSet[_gameIndexDispatch] = true
 _cclosureSet[_gameNewIndexDispatch] = true
 _cclosureSet[_gameNamecallDispatch] = true
+_cclosureSet[_origGameNamecall] = true
 _gameRawMt.__index = _gameIndexDispatch
 _gameRawMt.__newindex = _gameNewIndexDispatch
 _gameRawMt.__namecall = _gameNamecallDispatch
@@ -3405,8 +3580,6 @@ local _gameMt = table.freeze(_gameRawMt)
 -- Build isolated executor + Roblox sandbox environment
 local _waitBudget = 0
 local _MAX_WAIT_CALLS = 10000
-
-local _cclosureNames = hostSetmetatable({}, { __mode = "k" })
 
 local _instanceAsTable = false
 local _probedInstanceType = false
@@ -3794,7 +3967,10 @@ local _safeTask = {
         if step < 0 then step = 0 end
         _simTime = _simTime + step
         if _workspace then
-            _workspace.DistributedGameTime = (_workspace.DistributedGameTime or 10) + step
+            local wp = _proxyProps[_workspace]
+            if wp then
+                wp.DistributedGameTime = (wp.DistributedGameTime or 100) + step
+            end
         end
         local hb = _services.RunService and _services.RunService.Heartbeat
         if hb and hb.Fire then hb:Fire(step) end
@@ -4006,6 +4182,8 @@ local function _makeSandboxEnv()
     env.Path2DControlPoint = _Path2DControlPoint
     env.RotationCurveKey = _RotationCurveKey
     env.PathWaypoint = _PathWaypoint
+    env.FloatCurveKey = _FloatCurveKey
+    env.DockWidgetPluginGuiInfo = _DockWidgetPluginGuiInfo
     env.Random  = _Random
     env.DateTime = _DateTime
     env.Font    = _Font
@@ -4317,19 +4495,62 @@ local function _makeSandboxEnv()
             hostError("bad argument #1 to 'clonefunction' (function expected)", 2)
         end
         local fn = ...
-        local w = function(...) return fn(...) end
+        local cell = _hookCells[fn]
+        local impl = cell and cell.f or fn
+        local w = function(...) return impl(...) end
         if _isSandboxCClosure(fn) then
             _cclosureSet[w] = true
         end
         return w
     end
-    env.hookfunction = function(target, replacement)
+    env.hookfunction = function(target, replacement, maybeCell)
+        if target == "__REG__" and hostType(replacement) == "function" and hostType(maybeCell) == "table" then
+            _hookCells[replacement] = maybeCell
+            return
+        end
+        if hostType(target) ~= "function" then
+            hostError("bad argument #1 to 'hookfunction' (function expected)", 2)
+        end
+        if hostType(replacement) ~= "function" then
+            hostError("bad argument #2 to 'hookfunction' (function expected)", 2)
+        end
+        local cell = _hookCells[target]
+        if cell then
+            local prev = cell.f
+            local origWrap = function(...) return prev(...) end
+            if _cclosureSet[target] then
+                _cclosureSet[origWrap] = true
+            end
+            cell.f = replacement
+            _hookedMap[target] = replacement
+            return origWrap
+        end
+        local callerEnv = env.getfenv(2)
+        if hostType(callerEnv) == "table" then
+            for k, v in hostPairs(callerEnv) do
+                if v == target then
+                    callerEnv[k] = replacement
+                end
+            end
+        end
         _hookedMap[target] = replacement
-        return target
+        local origWrap = function(...) return target(...) end
+        if _cclosureSet[target] then
+            _cclosureSet[origWrap] = true
+        end
+        return origWrap
     end
     env.replaceclosure = env.hookfunction
-    env.isfunctionhooked = function(fn) return _hookedMap[fn] ~= nil end
-    env.restorefunction = function(fn) _hookedMap[fn] = nil end
+    env.isfunctionhooked = function(fn)
+        local cell = _hookCells[fn]
+        if cell then return cell.f ~= cell.orig end
+        return _hookedMap[fn] ~= nil
+    end
+    env.restorefunction = function(fn)
+        local cell = _hookCells[fn]
+        if cell and cell.orig then cell.f = cell.orig end
+        _hookedMap[fn] = nil
+    end
     local _lockedStringMt = table.freeze({ __index = _safeString, __metatable = "The metatable is locked" })
     local _roGuardMt = { __newindex = function() hostError("attempt to modify a readonly table", 2) end }
     env.getrawmetatable = function(obj)
@@ -4363,6 +4584,9 @@ local function _makeSandboxEnv()
     end
     env.make_readonly = function(t) env.setreadonly(t, true) end
     env.make_writeable = function(t) env.setreadonly(t, false) end
+    env.makereadonly = env.make_readonly
+    env.makewriteable = env.make_writeable
+    env.make_writable = env.make_writeable
     env.hookmetamethod = function(...)
         if select("#", ...) < 3 then
             hostError("missing argument to 'hookmetamethod'", 2)
@@ -4374,6 +4598,9 @@ local function _makeSandboxEnv()
         if obj == _game and _gameHooks[method] ~= nil then
             local old = _gameHooks[method]
             _gameHooks[method] = fn
+            if method == "__namecall" then
+                _namecallHookedObjs[_game] = true
+            end
             return old
         end
         local mt = env.getrawmetatable(obj)
@@ -4382,8 +4609,32 @@ local function _makeSandboxEnv()
         if not (table.isfrozen and table.isfrozen(mt)) then
             rawset(mt, method, fn)
         end
+        if method == "__namecall" and obj ~= nil then
+            _namecallHookedObjs[obj] = true
+        end
         return old
     end
+    env.cache = {
+        iscached = function(inst)
+            if inst == nil then return false end
+            return not _invalidatedCache[inst]
+        end,
+        invalidate = function(inst)
+            if inst ~= nil then
+                _invalidatedCache[inst] = true
+            end
+        end,
+        replace = function(inst, replacement)
+            if inst ~= nil then
+                _cacheReplaced[inst] = replacement
+            end
+        end,
+    }
+    env.iscached = env.cache.iscached
+    env.invalidate = env.cache.invalidate
+    env.cache_iscached = env.cache.iscached
+    env.cache_invalidate = env.cache.invalidate
+    env.cache_replace = env.cache.replace
     env.getgc = function() return {} end
     env.filtergc = function() return {} end
     env.getreg = function() return { env.pcall, env.xpcall, env.type, env.tostring, env } end
@@ -4505,6 +4756,9 @@ local function _makeSandboxEnv()
         if select("#", ...) < 3 then hostError("missing argument to 'sethiddenproperty'", 2) end
         local obj, k, v = ...
         if not _proxyTypes[obj] or hostType(k) ~= "string" then hostError("invalid argument to 'sethiddenproperty'", 2) end
+        if k == "DistributedGameTime" then
+            return true
+        end
         hostPcall(function() obj[k] = v end)
         return true
     end
@@ -4540,19 +4794,30 @@ local function _makeSandboxEnv()
     env.rconsolewarn = function() end
     env.rconsoleinfo = function() end
     env.rconsoleclear = function() end
+    env.rconsoleinput = function() return "" end
     env.rconsoledestroy = function() end
     env.consolecreate = env.rconsolecreate
     env.consolesettitle = env.rconsolesettitle
     env.consoleprint = env.rconsoleprint
     env.consoleerror = env.rconsoleerror
     env.consolewarn = env.rconsolewarn
+    env.consoleinput = env.rconsoleinput
     env.consoledestroy = env.rconsoledestroy
     env.mouse1click = function() end
+    env.mouse1press = function() end
+    env.mouse1release = function() end
     env.mouse2click = function() end
+    env.mouse2press = function() end
+    env.mouse2release = function() end
+    env.mousescroll = function() end
     env.keypress = function() end
     env.keyrelease = function() end
     env.mousemoverel = function() end
     env.mousemoveabs = function() end
+    env.queue_on_teleport = function() end
+    env.queueonteleport = env.queue_on_teleport
+    env.clear_teleport_queue = function() end
+    env.clearteleportqueue = env.clear_teleport_queue
     env.decompile = function() return "-- decompiled" end
     env.getscriptbytecode = function() return "" end
     env.getscripthash = function() return "00000000" end
@@ -4705,8 +4970,41 @@ local function _makeSandboxEnv()
         end
         return out
     end
+    env.loadfile = function(...)
+        if select("#", ...) == 0 or hostType(...) ~= "string" then
+            hostError("bad argument #1 to 'loadfile' (string expected)", 2)
+        end
+        local path, chunkName = ...
+        local np = _vfsNorm(path)
+        local data = _vfsFiles[np]
+        if data == nil then
+            return nil, "file does not exist: " .. hostTostring(path)
+        end
+        return env.loadstring(data, chunkName or ("@" .. np))
+    end
+    env.getcustomasset = function(...)
+        if select("#", ...) == 0 or hostType(...) ~= "string" then
+            hostError("bad argument #1 to 'getcustomasset' (string expected)", 2)
+        end
+        local np = _vfsNorm(...)
+        return "rbxasset://temp/" .. np
+    end
+    env.getsynasset = env.getcustomasset
+    local _validHttpMethods = { GET = true, POST = true, PUT = true, DELETE = true, PATCH = true, HEAD = true, OPTIONS = true }
     env.request = function(opts)
-        local url = hostType(opts) == "table" and (opts.Url or opts.url) or opts
+        if hostType(opts) ~= "table" then
+            hostError("bad argument #1 to 'request' (table expected)", 2)
+        end
+        local url = opts.Url or opts.url
+        if hostType(url) ~= "string" or url == "" then
+            hostError("invalid request Url", 2)
+        end
+        local method = opts.Method or opts.method
+        if method ~= nil then
+            if hostType(method) ~= "string" or not _validHttpMethods[string.upper(method)] then
+                hostError("invalid HTTP method: " .. hostTostring(method), 2)
+            end
+        end
         _emitLine(string.format("request({ Url = %s })", _formatArg(url)))
         return { StatusCode = 200, Success = true, Body = "", Headers = {} }
     end
@@ -4813,26 +5111,50 @@ local function _makeSandboxEnv()
         end
         return string.format("%08x%08x%08x%08x%08x%08x%08x%08x", h0, h1, h2, h3, h4, h5, h6, h7)
     end
+    local function _cryptHash(s, alg)
+        local a = alg == nil and "sha256" or hostTostring(alg):lower():gsub("%-", "")
+        local hex = _sha256Hex(a .. ":" .. hostTostring(s or ""))
+        if a == "sha256" then return _sha256Hex(s) end
+        if a == "md5" then return hex:sub(1, 32) end
+        if a == "sha1" then return hex:sub(1, 40) end
+        return hex
+    end
+    local function _cryptRandomBytesB64(count)
+        local n = math.floor(hostTonumber(count) or 16)
+        if n < 0 or n > 65536 then
+            hostError("invalid byte count", 2)
+        end
+        local bytes = {}
+        for i = 1, n do
+            bytes[i] = string.char(math.random(0, 255))
+        end
+        return _b64Encode(table.concat(bytes))
+    end
+    local function _cryptEncrypt(...)
+        if select("#", ...) < 2 then hostError("missing argument to 'crypt.encrypt'", 2) end
+        return _b64Encode(hostTostring(...)), "iv"
+    end
+    local function _cryptDecrypt(...)
+        if select("#", ...) < 2 then hostError("missing argument to 'crypt.decrypt'", 2) end
+        return _b64Decode(hostTostring(...))
+    end
     env.crypt = {
         base64encode = _b64Encode,
         base64decode = _b64Decode,
         base64 = { encode = _b64Encode, decode = _b64Decode },
-        encrypt = function(...)
-            if select("#", ...) < 2 then hostError("missing argument to 'crypt.encrypt'", 2) end
-            return _b64Encode(hostTostring(...)), "iv"
-        end,
-        decrypt = function(...)
-            if select("#", ...) < 2 then hostError("missing argument to 'crypt.decrypt'", 2) end
-            return _b64Decode(hostTostring(...))
-        end,
-        hash = function(s, alg)
-            local a = alg == nil and "sha256" or hostTostring(alg):lower():gsub("%-", "")
-            local hex = _sha256Hex(a .. ":" .. hostTostring(s or ""))
-            if a == "sha256" then return _sha256Hex(s) end
-            if a == "md5" then return hex:sub(1, 32) end
-            if a == "sha1" then return hex:sub(1, 40) end
-            return hex
-        end,
+        encrypt = _cryptEncrypt,
+        decrypt = _cryptDecrypt,
+        hash = _cryptHash,
+        generatebytes = _cryptRandomBytesB64,
+        generatekey = function() return _cryptRandomBytesB64(32) end,
+        custom = {
+            encrypt = _cryptEncrypt,
+            decrypt = _cryptDecrypt,
+            hash = _cryptHash,
+        },
+        custom_encrypt = _cryptEncrypt,
+        custom_decrypt = _cryptDecrypt,
+        custom_hash = _cryptHash,
     }
     env.base64 = { encode = _b64Encode, decode = _b64Decode }
     env.bit = bit32
@@ -4843,6 +5165,7 @@ local function _makeSandboxEnv()
         unprotect_gui = function() end,
         set_thread_identity = env.setthreadidentity,
         get_thread_identity = env.getthreadidentity,
+        queue_on_teleport = env.queue_on_teleport,
     }
     env.fluxus = { request = env.request }
     env.lz4compress = function(s) return s end
@@ -4851,6 +5174,7 @@ local function _makeSandboxEnv()
         Fonts = { UI = 0, System = 1, Plex = 2, Monospace = 3 },
         new = function() return { Visible = false, Remove = function() end, Destroy = function() end } end,
     }
+    env.cleardrawcache = function() end
     env.WebSocket = { connect = function(url) _emitLine(string.format("WebSocket.connect(%s)", _formatArg(url))); return { Send = function() end, Close = function() end, OnMessage = _makeSignal("OnMessage"), OnClose = _makeSignal("OnClose") } end }
 
     local function _isDenseObfuscatedStage(src)
@@ -4861,9 +5185,143 @@ local function _makeSandboxEnv()
         return false
     end
 
+    local function _instrumentHookables(src)
+        if not src or (not src:find("hookfunction", 1, true) and not src:find("replaceclosure", 1, true)) then
+            return src
+        end
+        local function _hk_skstr(s, i)
+            local n = #s
+            local c = s:sub(i, i)
+            if c == '"' or c == "'" then
+                i = i + 1
+                while i <= n do
+                    local b = s:sub(i, i)
+                    if b == "\\" then i = i + 2
+                    elseif b == c then return i + 1
+                    else i = i + 1 end
+                end
+                return i
+            end
+            local eq = s:match("^%[(=*)%[", i)
+            if eq then
+                local cl = "]" .. eq .. "]"
+                local e = s:find(cl, i + 2 + #eq, true)
+                return e and (e + #cl) or (n + 1)
+            end
+            return i + 1
+        end
+        local function _hk_fend(s, start)
+            local n = #s
+            local d = 1
+            local i = start
+            while i <= n do
+                local c = s:sub(i, i)
+                if c == "-" and s:sub(i + 1, i + 1) == "-" then
+                    if s:match("^%-%-%[=*%[", i) then i = _hk_skstr(s, i + 2)
+                    else local e = s:find("\n", i, true); i = (e and (e + 1)) or (n + 1) end
+                elseif c == '"' or c == "'" then
+                    i = _hk_skstr(s, i)
+                elseif c == "[" and s:match("^%[=*%[", i) then
+                    i = _hk_skstr(s, i)
+                else
+                    local w = s:match("^([%a_][%w_]*)", i)
+                    if w then
+                        local we = i + #w
+                        if not s:sub(we, we):match("[%w_]") then
+                            if w == "function" or w == "do" or w == "if" or w == "while" or w == "for" or w == "repeat" then
+                                d = d + 1
+                            elseif w == "end" then
+                                d = d - 1
+                                if d == 0 then return we end
+                            elseif w == "until" then
+                                d = d - 1
+                                if d == 0 then return we end
+                            end
+                        end
+                        i = we
+                    else
+                        i = i + 1
+                    end
+                end
+            end
+            return nil
+        end
+        local out = {}
+        local pos = 1
+        local n = #src
+        local changed = false
+        while pos <= n do
+            local c = src:sub(pos, pos)
+            local handled = false
+            if c == "-" and src:sub(pos + 1, pos + 1) == "-" then
+                local ep
+                if src:match("^%-%-%[=*%[", pos) then ep = _hk_skstr(src, pos + 2)
+                else local e = src:find("\n", pos, true); ep = (e and (e + 1)) or (n + 1) end
+                out[#out + 1] = src:sub(pos, ep - 1)
+                pos = ep
+                handled = true
+            elseif c == '"' or c == "'" or (c == "[" and src:match("^%[=*%[", pos)) then
+                local ep = _hk_skstr(src, pos)
+                out[#out + 1] = src:sub(pos, ep - 1)
+                pos = ep
+                handled = true
+            elseif c == "l" and (pos == 1 or not src:sub(pos - 1, pos - 1):match("[%w_]")) then
+                local sub = src:sub(pos)
+                local _s, me2, vn2 = sub:find("^local%s+([%a_][%w_]*)%s*=%s*function%s*")
+                local isDecl = false
+                if not _s then
+                    _s, me2, vn2 = sub:find("^local%s+function%s+([%a_][%w_]*)%s*")
+                    isDecl = _s ~= nil
+                end
+                if _s then
+                    local pi = pos + me2
+                    while pi <= n and src:sub(pi, pi):match("%s") do pi = pi + 1 end
+                    if src:sub(pi, pi) == "(" then
+                        local pd, pj, pe2 = 0, pi, nil
+                        while pj <= n do
+                            local pc = src:sub(pj, pj)
+                            if pc == '"' or pc == "'" then
+                                pj = _hk_skstr(src, pj) - 1
+                            elseif pc == "(" then
+                                pd = pd + 1
+                            elseif pc == ")" then
+                                pd = pd - 1
+                                if pd == 0 then pe2 = pj; break end
+                            end
+                            pj = pj + 1
+                        end
+                        if pe2 then
+                            local args = src:sub(pi, pe2)
+                            local fe = _hk_fend(src, pe2 + 1)
+                            if fe then
+                                local body = src:sub(pe2 + 1, fe - 4)
+                                local tx = string.format(
+                                    'local %s;do local _c={f=function%s%send};_c.orig=_c.f;%s=function(...)return _c.f(...)end;if type(hookfunction)=="function" then hookfunction("__REG__",%s,_c) end end',
+                                    vn2, args, body, vn2, vn2
+                                )
+                                out[#out + 1] = tx
+                                pos = fe
+                                changed = true
+                                handled = true
+                            end
+                        end
+                    end
+                end
+            end
+            if not handled then
+                out[#out + 1] = c
+                pos = pos + 1
+            end
+        end
+        return changed and table.concat(out) or src
+    end
+
     env.loadstring = function(src, chunkName, _mode, customEnv)
         if hostType(src) ~= "string" then
             return nil, "loadstring expected string"
+        end
+        if src:match("^%s*$") then
+            hostError("[string \"loadstring\"]:1: syntax error: unexpected symbol near '<eof>'", 2)
         end
         local denseStage = _isDenseObfuscatedStage(src)
         local shouldEmit = #src >= 16 and not _seenStageHash[src] and _stageDepth < _MAX_STAGE_DEPTH and not denseStage
@@ -4873,7 +5331,11 @@ local function _makeSandboxEnv()
         elseif denseStage then
             _seenStageHash[src] = true
         end
-        local fn, loadErr = hostLoad(src, chunkName or "loadstring", "t", hostType(customEnv) == "table" and customEnv or env)
+        local prepared = _instrumentHookables(src)
+        local fn, loadErr = hostLoad(prepared, chunkName or "loadstring", "t", hostType(customEnv) == "table" and customEnv or env)
+        if not fn and prepared ~= src then
+            fn, loadErr = hostLoad(src, chunkName or "loadstring", "t", hostType(customEnv) == "table" and customEnv or env)
+        end
         if not fn then
             return nil, loadErr
         end
@@ -4908,10 +5370,24 @@ local function _makeSandboxEnv()
     env.setstack = _safeDebug.setstack
     env.getinfo = _safeDebug.getinfo
 
+    local _noHookCellWrap = {
+        loadstring = true, load = true, pcall = true, xpcall = true, error = true,
+        getfenv = true, setfenv = true, hookfunction = true, replaceclosure = true,
+        clonefunction = true, isfunctionhooked = true, restorefunction = true,
+    }
     for k, fn in hostPairs(env) do
         if hostType(fn) == "function" then
-            _cclosureSet[fn] = true
-            _cclosureNames[fn] = k
+            if _noHookCellWrap[k] then
+                _cclosureSet[fn] = true
+                _cclosureNames[fn] = k
+            else
+                local cell = { f = fn, orig = fn }
+                local w = function(...) return cell.f(...) end
+                _hookCells[w] = cell
+                _cclosureSet[w] = true
+                _cclosureNames[w] = k
+                env[k] = w
+            end
         end
     end
     for _, k in hostIpairs({ "game", "workspace", "Workspace", "math", "string", "table", "coroutine", "utf8", "bit32", "buffer", "task", "os", "debug", "print", "warn", "pcall", "xpcall", "type", "typeof", "tostring", "tonumber", "select", "next", "pairs", "ipairs", "rawget", "rawset", "rawequal", "rawlen", "error", "assert" }) do
@@ -4948,12 +5424,19 @@ local function _makeSandboxEnv()
         end
     end
 
+    env._instrumentHookables = _instrumentHookables
     return env
 end
 
 _sandboxEnv = _makeSandboxEnv()
+local _instSrcFn = _sandboxEnv._instrumentHookables
+_sandboxEnv._instrumentHookables = nil
+local _preparedMain = _instSrcFn and _instSrcFn(SOURCE_CODE) or SOURCE_CODE
 
-local mainFn, compileErr = hostLoad(SOURCE_CODE, "=Script", "t", _sandboxEnv)
+local mainFn, compileErr = hostLoad(_preparedMain, "=Script", "t", _sandboxEnv)
+if not mainFn and _preparedMain ~= SOURCE_CODE then
+    mainFn, compileErr = hostLoad(SOURCE_CODE, "=Script", "t", _sandboxEnv)
+end
 if not mainFn then
     local stripped = SOURCE_CODE:gsub("[\r\n]+%s*[Ss]tatus%s*:[^\r\n]*%s*$", "")
     if stripped ~= SOURCE_CODE and stripped ~= "" then
@@ -4997,7 +5480,13 @@ if _capturedCount == 0 and _probedInstanceType and not _instanceAsTable then
     _stageDepth = 0
     _apiCallCounts = {}
     _sandboxEnv = _makeSandboxEnv()
-    local retryFn = hostLoad(SOURCE_CODE, "=Script", "t", _sandboxEnv)
+    local _instRetry = _sandboxEnv._instrumentHookables
+    _sandboxEnv._instrumentHookables = nil
+    local _prepRetry = _instRetry and _instRetry(SOURCE_CODE) or SOURCE_CODE
+    local retryFn = hostLoad(_prepRetry, "=Script", "t", _sandboxEnv)
+    if not retryFn and _prepRetry ~= SOURCE_CODE then
+        retryFn = hostLoad(SOURCE_CODE, "=Script", "t", _sandboxEnv)
+    end
     if not retryFn then
         local stripped = SOURCE_CODE:gsub("[\r\n]+%s*[Ss]tatus%s*:[^\r\n]*%s*$", "")
         if stripped ~= SOURCE_CODE and stripped ~= "" then

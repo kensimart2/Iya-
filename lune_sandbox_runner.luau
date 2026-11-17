@@ -452,14 +452,17 @@ local function hardenRequestedEnvironment(requestedEnvironment)
         local prefix = msg ~= nil and (tostring(msg) .. "\n") or ""
         return prefix .. "stack traceback:\n\t[C]: in ?"
     end
+    local reqLoadfile = rawget(requestedEnvironment, "loadfile")
+    local hasSafeLoadfile = type(reqLoadfile) == "function" and reqLoadfile ~= environment.loadfile
     local blockedLookup = {
-        arg = true, io = true, require = true, dofile = true, loadfile = true,
+        arg = true, io = true, require = true, dofile = true, loadfile = not hasSafeLoadfile,
         package = true, socket = true, ffi = true, collectgarbage = true,
         dumperState = true, __ROBLOX_API_REGISTRY = true,
     }
+    local reqOs = rawget(requestedEnvironment, "os")
     local hardened = {
         _G = nil,
-        os = safeOs,
+        os = type(reqOs) == "table" and reqOs or safeOs,
         debug = wrappedDebug,
         string = type(reqString) == "table" and reqString or safeString,
         table = type(reqTable) == "table" and reqTable or safeTable,
@@ -615,6 +618,9 @@ environment.setfenv = function(target, requestedEnvironment)
 end
 
 environment.loadstring = function(source, chunkName, _mode, requestedEnvironment)
+    if type(source) == "string" and source:match("^%s*$") then
+        error("[string \"loadstring\"]:1: syntax error: unexpected symbol near '<eof>'", 2)
+    end
     local targetEnvironment = hardenRequestedEnvironment(requestedEnvironment)
     local ok, compiled = pcall(luau.load, source, {
         debugName = chunkName or "Script",
